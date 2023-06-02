@@ -3,24 +3,146 @@ import asyncio
 from tcp import Servidor
 import re
 
+#Lista de canais e nicks conectados no servidor
+nicks_Servidor = {}
+canais_Servidor = {}
 
 def validar_nome(nome):
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
 
+#PASSO 8 & 10
 def sair(conexao):
     print(conexao, 'conexão fechada')
+    #Removo o Nick de todos os servidores dos quais ele fazia parte
+    if conexao.nickAtual.lower() in nicks_Servidor:
+        del nicks_Servidor[conexao.nickAtual.lower()]
+
+    msg_Saida = b':' + conexao.nickAtual + b' QUIT :Connection closed\r\n'
+
+    #Envio mensagem para os servidores que a conexao saiu
+    for todos_canais in conexao.channels:
+        channel = todos_canais.lower()
+        canais_Servidor[channel].remove(conexao)
+        for canal_individual in canais_Servidor[channel]:
+            canal_individual.enviar(msg_Saida)
+
     conexao.fechar()
 
-
+#PASSO 2
 def dados_recebidos(conexao, dados):
     if dados == b'':
         return sair(conexao)
+    mensagem = conexao.fragmentos_msg + dados
+    for i in range(mensagem.count(b'\r\n')):
+        end = mensagem.find(b'\r\n')
+        checar_mensagem(conexao, mensagem[0:end+2])
+        mensagem = mensagem[end+2:]
+    conexao.fragmentos_msg = mensagem
+    
     print(conexao, dados)
 
+#Função auxiliar para chamar todas as respostas do servidor
+def checar_mensagem(conexao, mensagem):
+    if mensagem.startswith(b'PING'):
+        msg_PING(conexao, mensagem)
+    elif mensagem.startswith(b'NICK'):
+        msg_NICK(conexao, mensagem)
+    elif mensagem.startswith(b'PRIVMSG'):
+        msg_PRIVMSG(conexao, mensagem)
+    elif mensagem.startswith(b'JOIN'):
+        msg_JOIN(conexao, mensagem)
+    elif mensagem.startswith(b'PART'):
+        msg_PART(conexao, mensagem)
+
+#PASSO 1 
+def msg_PING(conexao, mensagem):
+    conexao.enviar(b':server PONG server :' + mensagem.split(b' ', 1)[1])
+
+#PASSO 3 e 4
+def msg_NICK(conexao, mensagem):
+    #Separa o NICK na mensagem
+    new_Nick = mensagem.split(b' ', 1)[1][:-2]
+    #Se o nick for valido, começo a fazer operações
+    if validar_nome(new_Nick):
+        nome_normalizado = new_Nick.lower()
+        #Caso o nick não exista no servidor, vou cadastrar ou alterar o novo nick
+        if(nome_normalizado not in nicks_Servidor):
+            if(conexao.nickAtual == b'*'):
+                conexao.enviar(b':server 001 ' + new_Nick + b' :Welcome\r\n')
+                conexao.enviar(b':server 422 ' + new_Nick + b' :MOTD File is missing\r\n')
+            else:
+                conexao.enviar(b':' + conexao.nickAtual + b' NICK ' + new_Nick + b'\r\n')
+                del nicks_Servidor[conexao.nickAtual.lower()]
+            nicks_Servidor[nome_normalizado] = conexao
+            conexao.nickAtual = new_Nick
+        #Situação em que o nick ja existe
+        else:
+            conexao.enviar(b':server 433 ' + conexao.nickAtual + b' ' + new_Nick + b' :Nickname is already in use\r\n') 
+    #Nick invalido      
+    else:
+        conexao.enviar(b':server 432 ' + conexao.nickAtual + b' ' + new_Nick + b' :Erroneous nickname\r\n')
+
+#PASSO 5 E 6
+def msg_PRIVMSG(conexao, mensagem):
+    #Separo a mensagem 2 vezes, para ter o destinario e o conteúdo da mensagem
+    destinatario = mensagem.split(b' ', 2)[1]
+    destinatario_nomarlizado = destinatario.lower()
+    conteudo_msg = mensagem.split(b' ', 2)[2]
+    #Se o destinatário não começar com #, quer dizer que vai enviar uma mensagem privada para um usuário especifico.
+    if(destinatario[0] != b'#' and destinatario_nomarlizado in nicks_Servidor):
+        nicks_Servidor[destinatario_nomarlizado].enviar(b':' + conexao.nickAtual + b' PRIVMSG ' + destinatario + b' ' + conteudo_msg)
+    #Se o destinatário começar com #, quer dizer que vai enviar uma mensagem para todos os membros dos canais
+    elif(destinatario[0:1] == b'#' and destinatario_nomarlizado in canais_Servidor):
+        for i in canais_Servidor[destinatario_nomarlizado]:
+            if(i != conexao):
+                i.enviar(b':' + conexao.nickAtual + b' PRIVMSG ' + destinatario + b' ' + conteudo_msg)
+    
+#PASSO 6 e 9
+def msg_JOIN(conexao, mensagem):
+    nome_canal = mensagem.split(b' ', 1)[1][:-2]
+    if(nome_canal[0:1] == b'#' and validar_nome(nome_canal[1:])):
+        #Caso o nome do canal for valido, adiciono ele na lista de canais que a conexao faz parte
+        conexao.channels.append(nome_canal)
+        nome_canal_normalizado = nome_canal.lower()
+        if(nome_canal_normalizado in canais_Servidor):
+            canais_Servidor[nome_canal_normalizado].append(conexao)
+        else:
+            canais_Servidor[nome_canal_normalizado] = [conexao]
+
+        membros_canal = []
+        msg_entrada_canal = (b':' + conexao.nickAtual + b' JOIN :'+ nome_canal + b'\r\n')
+
+        #Envio para todos os membros do canal que uma nova conexão entrou no canal
+        for i in canais_Servidor[nome_canal_normalizado]:
+            i.enviar(msg_entrada_canal)
+            membros_canal.append(i.nickAtual)
+        #Mensagens de protocolo
+        conexao.enviar(b':server 353 ' + conexao.nickAtual + b' = ' + nome_canal + b' :' + b' '.join(sorted(membros_canal)) + b'\r\n')
+        conexao.enviar(b':server 366 ' + conexao.nickAtual + b' ' + nome_canal + b' :End of /NAMES list.\r\n')
+    else:
+        conexao.enviar(b':server 403 ' + nome_canal + b' :No such channel' + b'\r\n')
+
+#PASSO 7 
+def msg_PART(conexao, mensagem):
+    nome_canal = mensagem.split(b' ', 2)[1]
+    if(b'\r\n' in nome_canal):
+        nome_canal = nome_canal[:-2]
+    nome_canal_normalizado = nome_canal.lower()
+    if(nome_canal[0:1] == b'#' and validar_nome(nome_canal[1:])):
+        conexao.channels.remove(nome_canal)
+        msg_saida_canal = b':' + conexao.nickAtual + b' PART ' + nome_canal +  b'\r\n'
+        for i in canais_Servidor[nome_canal_normalizado]:
+            i.enviar(msg_saida_canal)
+        canais_Servidor[nome_canal_normalizado].remove(conexao)
+    else:
+        conexao.enviar(b':server 403 ' + nome_canal + b' :No such channel' + b'\r\n')
 
 def conexao_aceita(conexao):
     print(conexao, 'nova conexão')
+    conexao.fragmentos_msg = b''
+    conexao.nickAtual = b'*'
+    conexao.channels = []
     conexao.registrar_recebedor(dados_recebidos)
 
 
